@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import random
-from logging.handlers import RotatingFileHandler
 
 import datasets
 import torch
@@ -28,6 +27,10 @@ from transformers import (
     set_seed,
 )
 from transformers.utils.versions import require_version
+
+from metric import f1_score_list
+from model import BertNER
+from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/token-classification/requirements.txt")
@@ -61,6 +64,10 @@ def parse_args():
     parser.add_argument(
         "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
     )
+    parser.add_argument("--do_train", action='store_true',
+                        help="Whether to run training.")
+    parser.add_argument("--only_do_eval", action='store_true',
+                        help="Whether to run eval on the dev set.")
     parser.add_argument(
         "--text_column_name",
         type=str,
@@ -225,7 +232,6 @@ def main():
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
-
     roFileHandler = RotatingFileHandler('./log/log.txt', maxBytes=5 * 1024, backupCount=3)
     roFileHandler.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -333,7 +339,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
 
     if args.model_name_or_path:
-        model = AutoModelForTokenClassification.from_pretrained(
+        model = BertNER.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
@@ -417,18 +423,21 @@ def main():
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
+    bert_optimizer = list(model.bert.named_parameters())
+    classifier_optimizer = list(model.classifier.named_parameters())
+    no_decay = ["bias", 'LayerNorm.bias', "LayerNorm.weight"]
     optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
+        {'params': [p for n, p in bert_optimizer if not any(nd in n for nd in no_decay)],
+         'weight_decay': 0.01},
+        {'params': [p for n, p in bert_optimizer if any(nd in n for nd in no_decay)],
+         'weight_decay': 0.0},
+        {'params': [p for n, p in classifier_optimizer if not any(nd in n for nd in no_decay)],
+         'lr': args.learning_rate * 5, 'weight_decay': 0.01},
+        {'params': [p for n, p in classifier_optimizer if any(nd in n for nd in no_decay)],
+         'lr': args.learning_rate * 5, 'weight_decay': 0.0},
+        {'params': model.crf.parameters(), 'lr': args.learning_rate * 5}
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
 
     # Use the device given by the `accelerator` object.
     device = accelerator.device
@@ -479,6 +488,22 @@ def main():
         ]
         return true_predictions, true_labels
 
+    def get_labels_ray(predictions, references):
+        if device.type == "cpu":
+            y_true = references.detach().clone().numpy()
+        else:
+            y_true = references.detach().cpu().clone().numpy()
+        # Remove ignored index (special tokens)
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
+            for pred, gold_label in zip(predictions, y_true)
+        ]
+        true_labels = [
+            [label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
+            for pred, gold_label in zip(predictions, y_true)
+        ]
+        return true_predictions, true_labels
+
     def compute_metrics():
         results = metric.compute()
         if args.return_entity_level_metrics:
@@ -515,63 +540,88 @@ def main():
 
     best_f1 = 0
     early_stop_count = 0
-    for epoch in range(args.num_train_epochs):
-        # model.train()
-        # for step, batch in enumerate(train_dataloader):
-        #     outputs = model(**batch)
-        #     loss = outputs.loss
-        #     loss = loss / args.gradient_accumulation_steps
-        #     accelerator.backward(loss)
-        #     if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-        #         optimizer.step()
-        #         lr_scheduler.step()
-        #         optimizer.zero_grad()
-        #         progress_bar.update(1)
-        #         completed_steps += 1
-        #         writer.add_scalar('train_loss', loss, completed_steps)
-        #         writer.add_scalar('lr', lr_scheduler.get_lr()[0], completed_steps)
-        #
-        #     if completed_steps >= args.max_train_steps:
-        #         break
-        # accelerator.print(f'loss in this epoch {epoch} is {loss.item()}')
+    if args.do_train:
+        for epoch in range(args.num_train_epochs):
+            model.train()
+            for step, batch in enumerate(train_dataloader):
+                outputs = model(**batch)
+                loss = outputs[0]
+                loss = loss / args.gradient_accumulation_steps
+                accelerator.backward(loss)
+                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    # optimizer.zero_grad()
+                    model.zero_grad()
+                    progress_bar.update(1)
+                    completed_steps += 1
+                    writer.add_scalar('train_loss', loss, completed_steps)
+                    writer.add_scalar('lr', lr_scheduler.get_lr()[0], completed_steps)
 
+                if completed_steps >= args.max_train_steps:
+                    break
+            accelerator.print(f'loss in this epoch {epoch} is {loss.item()}')
+
+            model.eval()
+            pred_list = []
+            ref_list = []
+            positive_list = ['B-MISC', 'I-MISC']
+            for step, batch in enumerate(eval_dataloader):
+                labels = batch["labels"]
+                if 'labels' in batch:
+                    del batch["labels"]
+                with torch.no_grad():
+                    outputs = model(**batch)[0]
+                predictions = model.crf.decode(outputs, batch['attention_mask'].byte())
+
+                if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+                    labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                labels_gathered = accelerator.gather(labels)
+                preds, refs = get_labels_ray(predictions, labels_gathered)
+                pred_list.extend(preds)
+                ref_list.extend(refs)
+
+            eval_metric = f1_score_list(pred_list, ref_list, positive_list)
+            accelerator.print(eval_metric)
+
+            if eval_metric['f1'] > best_f1:
+                best_f1 = eval_metric['f1']
+                early_stop_count = 0
+            else:
+                early_stop_count += 1
+
+            if early_stop_count >= args.early_stop:
+                break
+            accelerator.print(f'best_f1 is {best_f1}')
+        accelerator.print(f'final f1 is {best_f1}')
+
+        if args.output_dir is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+
+    if args.only_do_eval:
+        pred_list = []
+        ref_list = []
+        positive_list = ['B-MISC', 'I-MISC']
         model.eval()
         for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
             labels = batch["labels"]
+            if 'labels' in batch:
+                del batch["labels"]
+            with torch.no_grad():
+                outputs = model(**batch)[0]
+            predictions = model.crf.decode(outputs, batch['attention_mask'].byte())
+
             if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
                 labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-
-            predictions_gathered = accelerator.gather(predictions)
             labels_gathered = accelerator.gather(labels)
-            preds, refs = get_labels(predictions_gathered, labels_gathered)
-            metric.add_batch(
-                predictions=preds,
-                references=refs,
-            )  # predictions and preferences are expected to be a nested list of labels, not label_ids
+            preds, refs = get_labels_ray(predictions, labels_gathered)
+            pred_list.extend(preds)
+            ref_list.extend(refs)
 
-        # eval_metric = metric.compute()
-        eval_metric = compute_metrics()
-        accelerator.print(f"epoch {epoch}:", eval_metric)
-
-        if eval_metric['f1'] > best_f1:
-            best_f1 = eval_metric['f1']
-            early_stop_count = 0
-        else:
-            early_stop_count += 1
-
-        if early_stop_count >= args.early_stop:
-            break
-        accelerator.print(f'best_f1 is {best_f1}')
-    accelerator.print(f'final f1 is {best_f1}')
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+        eval_metric = f1_score_list(pred_list, ref_list, positive_list)
+        accelerator.print(eval_metric)
 
 
 if __name__ == "__main__":

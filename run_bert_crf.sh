@@ -1,8 +1,9 @@
 export TASK_NAME=ner
 export DATA_DIR='/home/ray/project/AnswerExtract/dataset/cmrc'
 
-accelerate launch run.py \
+accelerate launch run_bert_crf.py \
   --model_name_or_path bert-base-chinese \
+  --do_train \
   --train_file $DATA_DIR/cmrc_tc_sen_train.json \
   --validation_file $DATA_DIR/cmrc_tc_sen_dev.json \
   --task_name $TASK_NAME \
