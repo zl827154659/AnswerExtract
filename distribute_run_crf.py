@@ -1,19 +1,17 @@
 import argparse
-import json
+import copy
 import logging
 import math
 import os
 import random
 
-import datasets
 import torch
 from datasets import ClassLabel, load_dataset, load_metric
+from torch.utils.data import RandomSampler, DistributedSampler, SequentialSampler
 from torch.utils.data.dataloader import DataLoader
 from tqdm.auto import tqdm
 from tensorboardX import SummaryWriter
 
-import transformers
-from accelerate import Accelerator
 from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
@@ -31,12 +29,9 @@ from transformers.utils.versions import require_version
 
 from metric import f1_score_list
 from model import BertNER
-from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/token-classification/requirements.txt")
-
-writer = SummaryWriter()
 
 # You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
@@ -132,7 +127,7 @@ def parse_args():
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -187,11 +182,16 @@ def parse_args():
         choices=["ner", "pos", "chunk"],
         help="The name of the task.",
     )
+    parser.add_argument("--no_cuda", action='store_true',
+                        help="Whether not to use CUDA when available")
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Activate debug mode and run training only with a subset of data.",
     )
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="local_rank for distributed training on gpus")
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -214,35 +214,28 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    accelerator = Accelerator()
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state)
+    logger.info(args)
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or args.no_cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.n_gpu = torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend='nccl')
+        args.n_gpu = 1
+    args.device = device
 
-    # Setup logging, we only want one process per machine to log things on the screen.
-    # accelerator.is_local_main_process is only True for one process per machine.
-    logger.setLevel(logging.INFO if accelerator.is_local_main_process else logging.ERROR)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-    roFileHandler = RotatingFileHandler('./log/log.txt', maxBytes=5 * 1024, backupCount=3)
-    roFileHandler.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-    roFileHandler.setFormatter(formatter)
-
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    console.setFormatter(formatter)
-    logger.addHandler(roFileHandler)
-    logger.addHandler(console)
+    # Load pretrained model and tokenizer
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model &
+        # vocab
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -351,6 +344,11 @@ def main():
 
     model.resize_token_embeddings(len(tokenizer))
 
+    if args.local_rank == 0:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model &
+        # vocab
+    model.to(args.device)
+
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     padding = "max_length" if args.pad_to_max_length else False
@@ -414,13 +412,20 @@ def main():
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
         data_collator = DataCollatorForTokenClassification(
-            tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
+            tokenizer, pad_to_multiple_of=None
         )
+    if args.local_rank in [-1, 0]:
+        writer = SummaryWriter()
 
+    args.train_batch_size = args.per_device_train_batch_size * max(1, args.n_gpu)
+    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset, shuffle=True)
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, sampler=train_sampler, collate_fn=data_collator, batch_size=args.train_batch_size
     )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    args.eval_batch_size = args.per_device_train_batch_size * max(1, args.n_gpu)
+    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset, shuffle=False)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, collate_fn=data_collator,
+                                 batch_size=args.eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -440,15 +445,6 @@ def main():
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False)
 
-    # Use the device given by the `accelerator` object.
-    device = accelerator.device
-    model.to(device)
-
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
-    )
-
     # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
     # shorter in multiprocess)
 
@@ -466,31 +462,18 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
-    # Metrics
-    metric = load_metric("seqeval")
+    # multi-gpu training (should be after apex fp16 initialization)
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
 
-    def get_labels(predictions, references):
-        # Transform predictions and references tensos to numpy arrays
-        if device.type == "cpu":
-            y_pred = predictions.detach().clone().numpy()
-            y_true = references.detach().clone().numpy()
-        else:
-            y_pred = predictions.detach().cpu().clone().numpy()
-            y_true = references.detach().cpu().clone().numpy()
-
-        # Remove ignored index (special tokens)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        return true_predictions, true_labels
+    # Distributed training (should be after apex fp16 initialization)
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
+                                                          output_device=args.local_rank,
+                                                          find_unused_parameters=True)
 
     def get_labels_ray(predictions, references):
-        if device.type == "cpu":
+        if args.device == "cpu":
             y_true = references.detach().clone().numpy()
         else:
             y_true = references.detach().cpu().clone().numpy()
@@ -505,55 +488,35 @@ def main():
         ]
         return true_predictions, true_labels
 
-    def compute_metrics():
-        results = metric.compute()
-        if args.return_entity_level_metrics:
-            # Unpack nested dictionaries
-            final_results = {}
-            for key, value in results.items():
-                if isinstance(value, dict):
-                    for n, v in value.items():
-                        final_results[f"{key}_{n}"] = v
-                else:
-                    final_results[key] = value
-            return final_results
-        else:
-            return {
-                "precision": results["overall_precision"],
-                "recall": results["overall_recall"],
-                "f1": results["overall_f1"],
-                "accuracy": results["overall_accuracy"],
-            }
-
     # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {args.train_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.max_train_steps), disable=args.local_rank not in [-1, 0])
     completed_steps = 0
 
     best_f1 = 0
     early_stop_count = 0
-
-    tr_loss, logging_loss = 0.0, 0.0
-
     if args.do_train:
         for epoch in range(args.num_train_epochs):
             model.train()
             for step, batch in enumerate(train_dataloader):
                 outputs = model(**batch)
                 loss = outputs[0]
-                loss = loss / args.gradient_accumulation_steps
-                accelerator.backward(loss)
 
-                tr_loss += loss.item()
+                if args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     optimizer.step()
                     lr_scheduler.step()
@@ -561,15 +524,22 @@ def main():
                     model.zero_grad()
                     progress_bar.update(1)
                     completed_steps += 1
-                    writer.add_scalar('train_loss', (tr_loss - logging_loss), completed_steps)
-                    writer.add_scalar('lr', lr_scheduler.get_lr()[0], completed_steps)
-                    logging_loss = tr_loss
+                    if args.local_rank in [-1, 0]:
+                        writer.add_scalar('train_loss', loss, completed_steps)
+                        writer.add_scalar('lr', lr_scheduler.get_lr()[0], completed_steps)
 
                 if completed_steps >= args.max_train_steps:
                     break
-            accelerator.print(f'loss in this epoch {epoch} is {loss.item()}')
+            logger.info(f'loss in this epoch {epoch} is {loss.item()}')
 
+            if args.local_rank in [-1, 0]:
+                writer.close()
+
+            # eval!
             model.eval()
+            logger.info("***** Running evaluation {} *****".format(""))
+            logger.info("  Num examples = %d", len(eval_dataset))
+            logger.info("  Batch size = %d", args.eval_batch_size)
             pred_list = []
             ref_list = []
             positive_list = ['B-MISC', 'I-MISC']
@@ -581,15 +551,12 @@ def main():
                     outputs = model(**batch)[0]
                 predictions = model.crf.decode(outputs, batch['attention_mask'].byte())
 
-                if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                    labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-                labels_gathered = accelerator.gather(labels)
-                preds, refs = get_labels_ray(predictions, labels_gathered)
+                preds, refs = get_labels_ray(predictions, labels)
                 pred_list.extend(preds)
                 ref_list.extend(refs)
 
             eval_metric = f1_score_list(pred_list, ref_list, positive_list)
-            accelerator.print(eval_metric)
+            logger.info(eval_metric)
 
             if eval_metric['f1'] > best_f1:
                 best_f1 = eval_metric['f1']
@@ -599,13 +566,23 @@ def main():
 
             if early_stop_count >= args.early_stop:
                 break
-            accelerator.print(f'best_f1 is {best_f1}')
-        accelerator.print(f'final f1 is {best_f1}')
+            logger.info(f'best_f1 is {best_f1}')
+        logger.info(f'final f1 is {best_f1}')
 
         if args.output_dir is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+            # Save the trained model and the tokenizer
+            if args.local_rank == -1 or torch.distributed.get_rank() == 0:
+                # Create output directory if needed
+                if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+                    os.makedirs(args.output_dir)
+
+                logger.info("Saving model checkpoint to %s", args.output_dir)
+                # Save a trained model, configuration and tokenizer using `save_pretrained()`.
+                # They can then be reloaded using `from_pretrained()`
+                best_model = copy.deepcopy(model.module if hasattr(model, "module") else model)
+                model_to_save = best_model
+                model_to_save.save_pretrained(args.output_dir)
+                tokenizer.save_pretrained(args.output_dir)
 
     if args.only_do_eval:
         pred_list = []
@@ -613,28 +590,28 @@ def main():
         positive_list = ['B-MISC', 'I-MISC']
         model.eval()
         for step, batch in enumerate(eval_dataloader):
+            batch = to_device(batch, args.device)
             labels = batch["labels"]
             if 'labels' in batch:
                 del batch["labels"]
             with torch.no_grad():
                 outputs = model(**batch)[0]
-            predictions = model.crf.decode(outputs, batch['attention_mask'].byte())
+            predictions = model.module.crf.decode(outputs.cuda(), batch['attention_mask'].byte().cuda())
 
-            if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
-            labels_gathered = accelerator.gather(labels)
-            preds, refs = get_labels_ray(predictions, labels_gathered)
+            preds, refs = get_labels_ray(predictions, labels)
             pred_list.extend(preds)
             ref_list.extend(refs)
 
-        write_predictions(pred_list, './result/prediction.json')
         eval_metric = f1_score_list(pred_list, ref_list, positive_list)
-        accelerator.print(eval_metric)
+        logger.info(eval_metric)
 
 
-def write_predictions(pred_list, pred_output):
-    with open(pred_output, 'w') as f:
-        json.dump(pred_list, f)
+def to_device(batch, device):
+    converted_batch = dict()
+    for key in batch.keys():
+        converted_batch[key] = batch[key].to(device)
+
+    return converted_batch
 
 
 if __name__ == "__main__":

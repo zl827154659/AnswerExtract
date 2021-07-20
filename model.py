@@ -53,6 +53,5 @@ class BertNER(BertPreTrainedModel):
             final_logits = active_logits.index_select(0, select_index).unsqueeze(0)
             loss = self.crf(final_logits, final_labels) * (-1)
             outputs = (loss,) + outputs
-
         # contain: (loss), scores
         return outputs
